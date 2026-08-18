@@ -3,6 +3,7 @@
 
 Copyright (c) 2015 - 2024, Intel Corporation. All rights reserved.<BR>
 (C) Copyright 2016 Hewlett Packard Enterprise Development LP<BR>
+Copyright (c) Qualcomm Technologies, Inc. All rights reserved.<BR>
 SPDX-License-Identifier: BSD-2-Clause-Patent
 
 **/
@@ -25,6 +26,7 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #include <Protocol/MpService.h>
 #include <Protocol/VariableWrite.h>
 #include <Protocol/Tcg2Protocol.h>
+#include <Protocol/Tcg2ProtocolEx.h>
 #include <Protocol/TrEEProtocol.h>
 #include <Protocol/ResetNotification.h>
 
@@ -1586,6 +1588,132 @@ EFI_TCG2_PROTOCOL  mTcg2Protocol = {
 };
 
 /**
+  Build a TCG2 event from the supplied digest list and add it to the Event Log
+  without extending a PCR.
+
+  This service allows a caller that has already computed a digest list to log
+  the corresponding event, mirroring the logging portion of
+  Tcg2HashLogExtendEvent without performing the hash and extend operations.
+
+  @param[in]      This             Indicates the calling context.
+  @param[in]      DigestList       Pointer to the list of digests to log
+                                   (TPML_DIGEST_VALUES).
+  @param[in]      DigestListSize   Size, in bytes, of the digest list.
+  @param[in]      Tcg2Event        Pointer to the buffer containing information
+                                   about the event (EFI_TCG2_EVENT).
+  @param[in]      Tcg2EventSize    The size, in bytes, of the Tcg2Event buffer.
+
+  @retval EFI_SUCCESS              The event was logged successfully.
+  @retval EFI_INVALID_PARAMETER    One or more parameters are invalid.
+  @retval EFI_BUFFER_TOO_SMALL     The Tcg2Event buffer is too small.
+  @retval EFI_DEVICE_ERROR         The operation was unsuccessful.
+**/
+EFI_STATUS
+EFIAPI
+Tcg2LogEvent (
+  IN EFI_TCG2_PROTOCOL_EX  *This,
+  IN VOID                  *DigestList,
+  IN UINTN                 DigestListSize,
+  IN VOID                  *Tcg2Event,
+  IN UINTN                 Tcg2EventSize
+  )
+{
+  EFI_STATUS          Status;
+  TCG_PCR_EVENT_HDR   NewEventHdr;
+  EFI_TCG2_EVENT      *Event;
+  TPML_DIGEST_VALUES  *DigestValues;
+  UINT32              DigestCount;
+  UINT32              DigestIndex;
+  UINT16              DigestSize;
+  UINTN               ExpectedSize;
+
+  DEBUG ((DEBUG_ERROR, "Tcg2LogEvent ...\n"));
+
+  if ((This == NULL) || (DigestList == NULL) || (DigestListSize == 0) ||
+      (Tcg2Event == NULL) || (Tcg2EventSize == 0))
+  {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  DigestValues = (TPML_DIGEST_VALUES *)DigestList;
+
+  if (DigestListSize < OFFSET_OF (TPML_DIGEST_VALUES, digests)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  DigestCount = DigestValues->count;
+  if ((DigestCount == 0) || (DigestCount > HASH_COUNT)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  ExpectedSize = OFFSET_OF (TPML_DIGEST_VALUES, digests);
+  for (DigestIndex = 0; DigestIndex < DigestCount; DigestIndex++) {
+    DigestSize = GetHashSizeFromAlgo (DigestValues->digests[DigestIndex].hashAlg);
+
+    if (DigestSize == 0) {
+      return EFI_INVALID_PARAMETER;
+    }
+
+    ExpectedSize += sizeof (TPMI_ALG_HASH) + DigestSize;
+    if (ExpectedSize > DigestListSize) {
+      return EFI_INVALID_PARAMETER;
+    }
+  }
+
+  if (ExpectedSize != DigestListSize) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (!mTcgDxeData.BsCap.TPMPresentFlag) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  Event = (EFI_TCG2_EVENT *)Tcg2Event;
+
+  if (Tcg2EventSize < OFFSET_OF (EFI_TCG2_EVENT, Event)) {
+    return EFI_BUFFER_TOO_SMALL;
+  }
+
+  if (Event->Header.HeaderSize != sizeof (EFI_TCG2_EVENT_HEADER)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (Event->Header.HeaderVersion != EFI_TCG2_EVENT_HEADER_VERSION) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (Event->Size < Event->Header.HeaderSize + sizeof (Event->Size)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (Event->Size > Tcg2EventSize) {
+    return EFI_BUFFER_TOO_SMALL;
+  }
+
+  if ((Event->Header.EventType != EV_NO_ACTION) && (Event->Header.PCRIndex > MAX_PCR_INDEX)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  NewEventHdr.PCRIndex  = Event->Header.PCRIndex;
+  NewEventHdr.EventType = Event->Header.EventType;
+  NewEventHdr.EventSize = Event->Size - sizeof (UINT32) - Event->Header.HeaderSize;
+
+  Status = TcgDxeLogHashEvent (
+             DigestValues,
+             &NewEventHdr,
+             Event->Event
+             );
+
+  DEBUG ((DEBUG_VERBOSE, "Tcg2LogEvent - %r\n", Status));
+  return Status;
+}
+
+EFI_TCG2_PROTOCOL_EX  mTcg2ProtocolEx = {
+  EFI_TCG2_PROTOCOL_EX_REVISION,
+  Tcg2LogEvent
+};
+
+/**
   Initialize the Event Log and log events passed from the PEI phase.
 
   @retval EFI_SUCCESS           Operation completed successfully.
@@ -2746,6 +2874,8 @@ InstallTcg2 (
                   &Handle,
                   &gEfiTcg2ProtocolGuid,
                   &mTcg2Protocol,
+                  &gEfiTcg2ProtocolExGuid,
+                  &mTcg2ProtocolEx,
                   NULL
                   );
   return Status;
